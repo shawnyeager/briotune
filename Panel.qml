@@ -566,6 +566,7 @@ Panel {
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
               text: "󰖠  " + root.modelName
+              textFormat: Text.PlainText
               color: root.fg
               font.family: root.fontFamily
               font.pixelSize: Style.font.title

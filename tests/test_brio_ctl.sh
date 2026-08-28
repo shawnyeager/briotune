@@ -197,6 +197,50 @@ if "!root.opened && !root.wantPreview" in text:
     raise SystemExit("probe skipped while opened")
 PY
 
+python3 - "$CLI" <<'PY' || fail "USB HTML in lsusb model is not stripped"
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+m = re.search(r"(def sanitize_label\(.*?)def card_from_v4l2", text, re.S)
+if not m:
+    raise SystemExit("sanitize_label missing")
+ns = {"re": re}
+exec(compile(m.group(1), "brio-ctl", "exec"), ns)
+line = 'Bus 001 Device 003: ID 046d:085e <img src="https://evil.example/x">'
+raw = ns["model_from_lsusb"](line)
+clean = ns["sanitize_label"](raw)
+if "<" in clean or "src=" in clean or "http" in clean.lower():
+    raise SystemExit(f"HTML survived sanitize_label: {clean!r}")
+if ns["sanitize_label"]('<img src="https://evil.example/x">') != "BRIO":
+    raise SystemExit("tag-only model did not fall back to BRIO")
+if ns["sanitize_label"]("BRIO Ultra HD Webcam") != "BRIO Ultra HD Webcam":
+    raise SystemExit("safe model string was rewritten")
+PY
+python3 - "$CLI" <<'PY' || fail "resolve() emits USB model without sanitize_label"
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+fn = re.search(r"def resolve\(\) -> dict\[str, Any\] \| None:.*?\n    return \{.*?\n    \}", text, re.S)
+if not fn:
+    raise SystemExit("resolve missing")
+body = fn.group(0)
+if not re.search(r'"model":\s*sanitize_label\(', body):
+    raise SystemExit("resolve does not sanitize model")
+if not re.search(r'"name":\s*sanitize_label\(', body):
+    raise SystemExit("resolve does not sanitize name")
+PY
+python3 - "$PANEL" <<'PY' || fail "modelName title Text is not PlainText"
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+needle = 'text: "󰖠  " + root.modelName'
+idx = text.find(needle)
+if idx < 0:
+    raise SystemExit("modelName title missing")
+start = text.rfind("Text {", 0, idx)
+end = text.find("}", idx)
+blob = text[start:end]
+if "textFormat: Text.PlainText" not in blob:
+    raise SystemExit("title Text lacks textFormat: Text.PlainText")
+PY
+
 grep -q cameractrls "$CLI" && fail "brio-ctl still depends on cameractrls" || true
 
 help="$("$CLI" --help)"

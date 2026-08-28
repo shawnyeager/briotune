@@ -446,6 +446,13 @@ def lsusb_brio() -> tuple[bool, str]:
     return ok, text.strip()
 
 
+def sanitize_label(raw: str, fallback: str = "BRIO") -> str:
+    text = re.sub(r"<[^>]*>", "", raw or "")
+    text = re.sub(r"[^A-Za-z0-9 .+\-]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:64] or fallback
+
+
 def model_from_lsusb(line: str) -> str:
     m = re.search(r"ID\s+[0-9a-f]{4}:[0-9a-f]{4}\s+(.*)$", line, re.I)
     raw = (m.group(1) if m else "").strip()
@@ -476,12 +483,12 @@ def resolve() -> dict[str, Any] | None:
     if "Logitech BRIO" not in blob and "BRIO" not in blob:
         return None
     card = card_from_v4l2(blob)
-    product = model_from_lsusb(lsusb_line)
+    product = sanitize_label(model_from_lsusb(lsusb_line), "")
     model = product or re.sub(r"^Logitech\s+", "", card) or "BRIO"
     return {
         "present": True,
-        "name": card or NAME,
-        "model": model,
+        "name": sanitize_label(card, NAME),
+        "model": sanitize_label(model),
         "usb": USB_ID,
         "serial": serial_from_path(main),
         "device": main,
