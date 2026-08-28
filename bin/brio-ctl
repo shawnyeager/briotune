@@ -1,0 +1,1066 @@
+#!/usr/bin/env bash
+# Logitech BRIO Ultra 4K (USB 046d:085e) control CLI.
+# Resolves the BRIO by USB id / by-id path. Never uses the first /dev/video*.
+set -euo pipefail
+
+export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
+
+python3 - "$@" <<'PY'
+from __future__ import annotations
+
+import ctypes
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from fcntl import ioctl
+from pathlib import Path
+from typing import Any
+
+USB_ID = "046d:085e"
+NAME = "Logitech BRIO"
+BY_ID_MAIN = "/dev/v4l/by-id/usb-046d_Logitech_BRIO_*-video-index0"
+BY_ID_IR = "/dev/v4l/by-id/usb-046d_Logitech_BRIO_*-video-index2"
+
+# Canonical names plus aliases the panel and tests send to v4l2-ctl.
+UVC = {
+    "brightness": "brightness",
+    "contrast": "contrast",
+    "saturation": "saturation",
+    "sharpness": "sharpness",
+    "gain": "gain",
+    "backlight": "backlight_compensation",
+    "backlight_compensation": "backlight_compensation",
+    "anti-flicker": "power_line_frequency",
+    "flicker": "power_line_frequency",
+    "power_line_frequency": "power_line_frequency",
+    "zoom": "zoom_absolute",
+    "zoom_absolute": "zoom_absolute",
+    "pan": "pan_absolute",
+    "pan_absolute": "pan_absolute",
+    "tilt": "tilt_absolute",
+    "tilt_absolute": "tilt_absolute",
+    "focus-auto": "focus_automatic_continuous",
+    "focus_automatic_continuous": "focus_automatic_continuous",
+    "focus": "focus_absolute",
+    "focus_absolute": "focus_absolute",
+    "exposure-auto": "auto_exposure",
+    "auto_exposure": "auto_exposure",
+    "exposure": "exposure_time_absolute",
+    "exposure_time_absolute": "exposure_time_absolute",
+    "white-balance-auto": "white_balance_automatic",
+    "wb-auto": "white_balance_automatic",
+    "white_balance_automatic": "white_balance_automatic",
+    "white-balance": "white_balance_temperature",
+    "wb": "white_balance_temperature",
+    "white_balance_temperature": "white_balance_temperature",
+    "dynamic-framerate": "exposure_dynamic_framerate",
+    "exposure_dynamic_framerate": "exposure_dynamic_framerate",
+}
+
+LOOKS = ["default", "blossom", "bright", "film", "forest", "glaze", "gray", "vibrant", "vivid"]
+FOV_VALUES = [65, 78, 90]
+LED_MODES = ["off", "on", "blink", "auto"]
+
+# Logitech BRIO XU. FoV is a 1-byte menu. LED mode and frequency share
+# a 5-byte peripheral control.
+BRIO_FOV_GUID = bytes.fromhex("1502e44934f4fe47b1580e885023e51b")
+PERIPH_LED_GUID = bytes.fromhex("212de5ff30802c4e82d9f587d00540bd")
+FOV_SEL, FOV_LEN = 0x05, 1
+FOV_BYTE = {65: 0x02, 78: 0x01, 90: 0x00}
+FOV_FROM_BYTE = {v: k for k, v in FOV_BYTE.items()}
+LED_SEL, LED_LEN = 0x09, 5
+LED_MODE_OFF, LED_FREQ_OFF = 1, 3
+LED_BYTE = {"off": 0x00, "on": 0x01, "blink": 0x02, "auto": 0x03}
+LED_FROM_BYTE = {v: k for k, v in LED_BYTE.items()}
+
+# Look overlays: camera defaults as 50%, then the named preset.
+LOOK_PRESETS: dict[str, dict[str, Any]] = {
+    "default": {},
+    "blossom": {
+        "white_balance_automatic": 0,
+        "white_balance_temperature": 7500,
+        "saturation": ("pct", 40),
+        "sharpness": ("pct", 30),
+    },
+    "bright": {"brightness": ("pct", 71), "contrast": ("pct", 59)},
+    "film": {"contrast": ("pct", 30), "saturation": ("pct", 70), "sharpness": ("pct", 100)},
+    "forest": {
+        "white_balance_automatic": 0,
+        "white_balance_temperature": 2800,
+        "brightness": ("pct", 55),
+        "saturation": ("pct", 20),
+    },
+    "glaze": {
+        "white_balance_automatic": 0,
+        "white_balance_temperature": 2800,
+        "contrast": ("pct", 60),
+        "saturation": ("pct", 55),
+        "sharpness": ("pct", 60),
+    },
+    "gray": {"saturation": ("pct", 0)},
+    "vibrant": {
+        "brightness": ("pct", 47.5),
+        "contrast": ("pct", 57.25),
+        "saturation": ("pct", 53.33),
+    },
+    "vivid": {
+        "white_balance_automatic": 0,
+        "white_balance_temperature": 6400,
+        "brightness": ("pct", 65),
+        "contrast": ("pct", 75),
+        "saturation": ("pct", 25),
+        "sharpness": ("pct", 60),
+    },
+}
+
+_IOC_NRBITS, _IOC_TYPEBITS, _IOC_SIZEBITS = 8, 8, 14
+_IOC_NRSHIFT = 0
+_IOC_TYPESHIFT = _IOC_NRSHIFT + _IOC_NRBITS
+_IOC_SIZESHIFT = _IOC_TYPESHIFT + _IOC_TYPEBITS
+_IOC_DIRSHIFT = _IOC_SIZESHIFT + _IOC_SIZEBITS
+_IOC_WRITE, _IOC_READ = 1, 2
+
+
+def _ioc(dir_: int, type_: str, nr: int, size: int) -> int:
+    return (
+        ctypes.c_int32(dir_ << _IOC_DIRSHIFT).value
+        | ctypes.c_int32(ord(type_) << _IOC_TYPESHIFT).value
+        | ctypes.c_int32(nr << _IOC_NRSHIFT).value
+        | ctypes.c_int32(size << _IOC_SIZESHIFT).value
+    )
+
+
+class UvcXuQuery(ctypes.Structure):
+    _fields_ = [
+        ("unit", ctypes.c_uint8),
+        ("selector", ctypes.c_uint8),
+        ("query", ctypes.c_uint8),
+        ("size", ctypes.c_uint16),
+        ("data", ctypes.c_void_p),
+    ]
+
+
+UVCIOC_CTRL_QUERY = _ioc(_IOC_READ | _IOC_WRITE, "u", 0x21, ctypes.sizeof(UvcXuQuery))
+UVC_SET_CUR, UVC_GET_CUR, UVC_GET_LEN = 0x01, 0x81, 0x85
+
+USER_HW_GUID = bytes.fromhex("820661637050ab49b8ccb3855e8d221f")
+MOTOR_GUID = bytes.fromhex("820661637050ab49b8ccb3855e8d2256")
+PT_REL_SEL, PT_REL_LEN = 0x01, 4
+PT_RST_SEL, PT_RST_LEN = 0x02, 1
+MOTOR_SEL, MOTOR_LEN = 0x03, 6
+PAN_REL = {
+    "-8": b"\x00\x08\x00\x00",
+    "-1": b"\x00\x01\x00\x00",
+    "1": b"\xff\xfe\x00\x00",
+    "8": b"\xff\xf7\x00\x00",
+}
+TILT_REL = {
+    "-3": b"\x00\x00\x00\x03",
+    "-1": b"\x00\x00\x00\x01",
+    "1": b"\x00\x00\xff\xfe",
+    "3": b"\x00\x00\xff\xfc",
+}
+PT_RESET = {"pan": b"\x01", "tilt": b"\x02", "both": b"\x03"}
+PT_PRESET = {f"save_{i}": bytes([0x03 + i]) for i in range(1, 9)}
+PT_PRESET.update({f"goto_{i}": bytes([0x0b + i]) for i in range(1, 9)})
+
+
+def _xu_query(fd: int, unit: int, selector: int, query: int, data: ctypes.Array) -> None:
+    q = UvcXuQuery()
+    q.unit = unit
+    q.selector = selector
+    q.query = query
+    q.size = len(data)
+    q.data = ctypes.cast(data, ctypes.c_void_p)
+    ioctl(fd, UVCIOC_CTRL_QUERY, q)
+
+
+def _unit_id(dev: str, guid: bytes) -> int:
+    real = os.path.realpath(dev)
+    name = os.path.basename(real)
+    desc = f"/sys/class/video4linux/{name}/../../../descriptors"
+    try:
+        blob = Path(desc).read_bytes()
+    except OSError:
+        return 0
+    i = blob.find(guid)
+    if i > 0:
+        return blob[i - 1]
+    return 0
+
+
+def _xu_has(dev: str, guid: bytes, selector: int) -> bool:
+    unit = _unit_id(dev, guid)
+    if unit == 0:
+        return False
+    fd = os.open(dev, os.O_RDWR)
+    try:
+        length = ctypes.c_uint16(0)
+        q = UvcXuQuery()
+        q.unit = unit
+        q.selector = selector
+        q.query = UVC_GET_LEN
+        q.size = 2
+        q.data = ctypes.cast(ctypes.pointer(length), ctypes.c_void_p)
+        ioctl(fd, UVCIOC_CTRL_QUERY, q)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _xu_rw(dev: str, guid: bytes, selector: int, size: int, data: bytes | None = None) -> bytes:
+    unit = _unit_id(dev, guid)
+    if unit == 0:
+        if data is None:
+            return b""
+        die("brio-ctl: Logitech XU is not on this node")
+    fd = os.open(dev, os.O_RDWR)
+    try:
+        buf = (ctypes.c_ubyte * size)()
+        if data is None:
+            _xu_query(fd, unit, selector, UVC_GET_CUR, buf)
+            return bytes(buf)
+        for i, b in enumerate(data):
+            buf[i] = b
+        _xu_query(fd, unit, selector, UVC_SET_CUR, buf)
+        return bytes(buf)
+    except OSError as e:
+        die(f"brio-ctl: UVC XU ioctl failed: {e}")
+    finally:
+        os.close(fd)
+    return b""
+
+
+def fov_get(dev: str) -> int | None:
+    raw = _xu_rw(dev, BRIO_FOV_GUID, FOV_SEL, FOV_LEN)
+    if not raw:
+        return None
+    return FOV_FROM_BYTE.get(raw[0])
+
+
+def fov_set(dev: str, deg: int) -> None:
+    _xu_rw(dev, BRIO_FOV_GUID, FOV_SEL, FOV_LEN, bytes([FOV_BYTE[deg]]))
+
+
+def _led_layout(dev: str) -> tuple[bytes, int, int, int, int] | None:
+    if _xu_has(dev, PERIPH_LED_GUID, LED_SEL):
+        return PERIPH_LED_GUID, LED_SEL, LED_LEN, LED_MODE_OFF, LED_FREQ_OFF
+    if _xu_has(dev, USER_HW_GUID, 0x01):
+        return USER_HW_GUID, 0x01, 3, 0, 2
+    return None
+
+
+def led_get(dev: str) -> tuple[str, int] | None:
+    layout = _led_layout(dev)
+    if not layout:
+        return None
+    guid, sel, size, mode_off, freq_off = layout
+    raw = _xu_rw(dev, guid, sel, size)
+    if not raw:
+        return None
+    mode = LED_FROM_BYTE.get(raw[mode_off], "auto")
+    return mode, int(raw[freq_off])
+
+
+def led_set(dev: str, mode: str | None = None, freq: int | None = None) -> None:
+    layout = _led_layout(dev)
+    if not layout:
+        die("brio-ctl: LED XU is not on this node")
+    guid, sel, size, mode_off, freq_off = layout
+    cur = bytearray(_xu_rw(dev, guid, sel, size))
+    if mode is not None:
+        cur[mode_off] = LED_BYTE[mode]
+    if freq is not None:
+        cur[freq_off] = max(0, min(255, int(freq)))
+    _xu_rw(dev, guid, sel, size, bytes(cur))
+
+
+def _need_xu(dev: str, guid: bytes, selector: int, label: str) -> None:
+    if not _xu_has(dev, guid, selector):
+        die(f"brio-ctl: {label} XU is not on this node")
+
+
+def pan_rel_set(dev: str, raw: str) -> None:
+    _need_xu(dev, PERIPH_LED_GUID, PT_REL_SEL, "pan-relative")
+    key = str(raw).strip()
+    if key not in PAN_REL:
+        die(f"brio-ctl: pan-relative expects {', '.join(PAN_REL)} (got {raw!r})")
+    _xu_rw(dev, PERIPH_LED_GUID, PT_REL_SEL, PT_REL_LEN, PAN_REL[key])
+
+
+def tilt_rel_set(dev: str, raw: str) -> None:
+    _need_xu(dev, PERIPH_LED_GUID, PT_REL_SEL, "tilt-relative")
+    key = str(raw).strip()
+    if key not in TILT_REL:
+        die(f"brio-ctl: tilt-relative expects {', '.join(TILT_REL)} (got {raw!r})")
+    _xu_rw(dev, PERIPH_LED_GUID, PT_REL_SEL, PT_REL_LEN, TILT_REL[key])
+
+
+def pantilt_reset_set(dev: str, raw: str) -> None:
+    _need_xu(dev, PERIPH_LED_GUID, PT_RST_SEL, "pantilt-reset")
+    key = str(raw).strip().lower()
+    if key not in PT_RESET:
+        die("brio-ctl: pantilt-reset expects pan|tilt|both")
+    _xu_rw(dev, PERIPH_LED_GUID, PT_RST_SEL, PT_RST_LEN, PT_RESET[key])
+
+
+def pantilt_preset_set(dev: str, raw: str) -> None:
+    _need_xu(dev, PERIPH_LED_GUID, PT_RST_SEL, "pantilt-preset")
+    key = str(raw).strip().lower()
+    if key not in PT_PRESET:
+        die("brio-ctl: pantilt-preset expects goto_1..goto_8 or save_1..save_8")
+    _xu_rw(dev, PERIPH_LED_GUID, PT_RST_SEL, PT_RST_LEN, PT_PRESET[key])
+
+
+def motor_focus_get(dev: str) -> int | None:
+    if not _xu_has(dev, MOTOR_GUID, MOTOR_SEL):
+        return None
+    raw = _xu_rw(dev, MOTOR_GUID, MOTOR_SEL, MOTOR_LEN)
+    return int(raw[0]) if raw else None
+
+
+def motor_focus_set(dev: str, raw: str) -> None:
+    _need_xu(dev, MOTOR_GUID, MOTOR_SEL, "motor-focus")
+    pos = max(0, min(255, int(raw)))
+    cur = bytearray(_xu_rw(dev, MOTOR_GUID, MOTOR_SEL, MOTOR_LEN) or bytes(MOTOR_LEN))
+    cur[0] = pos
+    _xu_rw(dev, MOTOR_GUID, MOTOR_SEL, MOTOR_LEN, bytes(cur))
+
+
+def _pct(rec: dict[str, Any], percent: float) -> int:
+    mn = int(rec["min"])
+    mx = int(rec["max"])
+    default = int(rec["default"])
+    val = round(mn + (default - mn) * (percent / 100.0) * 2)
+    return max(mn, min(mx, val))
+
+
+def apply_look(dev: str, look: str) -> None:
+    uvc = parse_v4l2_ctrls(dev)
+    first: dict[str, Any] = {}
+    rest: dict[str, Any] = {}
+    for name in (
+        "brightness",
+        "contrast",
+        "saturation",
+        "sharpness",
+        "white_balance_automatic",
+    ):
+        rec = uvc.get(name)
+        if rec and rec.get("default") is not None:
+            rest[name] = rec["default"]
+    if rest.get("white_balance_automatic") is not None:
+        first["white_balance_automatic"] = rest.pop("white_balance_automatic")
+    for key, spec in LOOK_PRESETS.get(look, {}).items():
+        rec = uvc.get(key)
+        if isinstance(spec, tuple) and spec[0] == "pct":
+            if not rec:
+                continue
+            rest[key] = _pct(rec, float(spec[1]))
+        elif key == "white_balance_automatic":
+            first[key] = spec
+            rest.pop("white_balance_automatic", None)
+        elif key == "white_balance_temperature":
+            first["white_balance_automatic"] = 0
+            rest[key] = spec
+        else:
+            rest[key] = spec
+    v4l2_set(dev, first)
+    v4l2_set(dev, rest)
+
+CANONICAL_STATUS_KEYS = [
+    "brightness",
+    "contrast",
+    "saturation",
+    "sharpness",
+    "gain",
+    "backlight",
+    "anti-flicker",
+    "zoom",
+    "pan",
+    "tilt",
+    "focus",
+    "focus-auto",
+    "exposure",
+    "exposure-auto",
+    "white-balance",
+    "white-balance-auto",
+    "dynamic-framerate",
+    "fov",
+    "look",
+    "led",
+    "led-frequency",
+    "pan-relative",
+    "tilt-relative",
+    "pantilt-reset",
+    "pantilt-preset",
+    "motor-focus",
+]
+
+V4L2_TO_CANON = {
+    "brightness": "brightness",
+    "contrast": "contrast",
+    "saturation": "saturation",
+    "sharpness": "sharpness",
+    "gain": "gain",
+    "backlight_compensation": "backlight",
+    "power_line_frequency": "anti-flicker",
+    "zoom_absolute": "zoom",
+    "pan_absolute": "pan",
+    "tilt_absolute": "tilt",
+    "focus_absolute": "focus",
+    "focus_automatic_continuous": "focus-auto",
+    "exposure_time_absolute": "exposure",
+    "auto_exposure": "exposure-auto",
+    "white_balance_temperature": "white-balance",
+    "white_balance_automatic": "white-balance-auto",
+    "exposure_dynamic_framerate": "dynamic-framerate",
+}
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd: list[str], check: bool = False, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, capture_output=True, check=check, timeout=timeout)
+
+
+def first_glob(pattern: str) -> str | None:
+    matches = sorted(glob.glob(pattern))
+    return matches[0] if matches else None
+
+
+def lsusb_brio() -> tuple[bool, str]:
+    r = run(["lsusb", "-d", USB_ID])
+    text = (r.stdout or "") + (r.stderr or "")
+    ok = r.returncode == 0 and USB_ID in text
+    return ok, text.strip()
+
+
+def model_from_lsusb(line: str) -> str:
+    m = re.search(r"ID\s+[0-9a-f]{4}:[0-9a-f]{4}\s+(.*)$", line, re.I)
+    raw = (m.group(1) if m else "").strip()
+    raw = re.sub(r"^Logitech,\s*Inc\.\s*", "", raw)
+    return raw.strip()
+
+
+def card_from_v4l2(blob: str) -> str:
+    m = re.search(r"Card type\s*:\s*(.+)", blob)
+    return m.group(1).strip() if m else ""
+
+
+def serial_from_path(path: str) -> str:
+    base = os.path.basename(path)
+    # usb-046d_Logitech_BRIO_ADF03892-video-index0
+    m = re.search(r"BRIO_([^-]+)-video", base)
+    return m.group(1) if m else ""
+
+
+def resolve() -> dict[str, Any] | None:
+    present, lsusb_line = lsusb_brio()
+    main = first_glob(BY_ID_MAIN)
+    ir = first_glob(BY_ID_IR)
+    if not present or not main or not os.path.exists(main):
+        return None
+    info = run(["v4l2-ctl", "-d", main, "--info"])
+    blob = (info.stdout or "") + (info.stderr or "")
+    if "Logitech BRIO" not in blob and "BRIO" not in blob:
+        return None
+    card = card_from_v4l2(blob)
+    product = model_from_lsusb(lsusb_line)
+    model = product or re.sub(r"^Logitech\s+", "", card) or "BRIO"
+    return {
+        "present": True,
+        "name": card or NAME,
+        "model": model,
+        "usb": USB_ID,
+        "serial": serial_from_path(main),
+        "device": main,
+        "ir_device": ir if ir and os.path.exists(ir) else None,
+        "lsusb": lsusb_line,
+    }
+
+
+def parse_v4l2_ctrls(dev: str) -> dict[str, dict[str, Any]]:
+    r = run(["v4l2-ctl", "-d", dev, "--list-ctrls"])
+    text = r.stdout or ""
+    ctrls: dict[str, dict[str, Any]] = {}
+    line_re = re.compile(
+        r"^\s+([A-Za-z0-9_]+)\s+0x[0-9a-fA-F]+\s+\((\w+)\)\s+:\s*(.*)$"
+    )
+    for line in text.splitlines():
+        m = line_re.match(line)
+        if not m:
+            continue
+        name, typ, rest = m.group(1), m.group(2), m.group(3)
+        fields = dict(re.findall(r"(\w+)=(-?\d+|[\w.]+)", rest))
+        inactive = "inactive" in rest
+        value = fields.get("value")
+        default = fields.get("default")
+        rec: dict[str, Any] = {
+            "name": name,
+            "type": typ,
+            "inactive": inactive,
+        }
+        for key in ("min", "max", "step", "value", "default"):
+            if key in fields:
+                rec[key] = coerce_num(fields[key])
+        if value is not None and "value" not in rec:
+            rec["value"] = value
+        if default is not None and "default" not in rec:
+            rec["default"] = default
+        ctrls[name] = rec
+    return ctrls
+
+
+def coerce_num(s: str) -> Any:
+    try:
+        if "." in s:
+            return float(s)
+        return int(s)
+    except ValueError:
+        return s
+
+
+def parse_vendor(dev: str) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "look": {"available": LOOKS, "readable": False},
+    }
+    deg = fov_get(dev)
+    out["fov"] = {"value": deg, "values": FOV_VALUES, "available": deg is not None}
+    led = led_get(dev)
+    if led:
+        mode, freq = led
+        out["led"] = {"value": mode, "values": LED_MODES, "available": True}
+        out["led-frequency"] = {"value": freq, "min": 0, "max": 255, "available": True}
+    else:
+        out["led"] = {"available": False}
+        out["led-frequency"] = {"available": False}
+    out["pan-relative"] = {
+        "available": _xu_has(dev, PERIPH_LED_GUID, PT_REL_SEL),
+        "values": list(PAN_REL),
+        "readable": False,
+    }
+    out["tilt-relative"] = {
+        "available": _xu_has(dev, PERIPH_LED_GUID, PT_REL_SEL),
+        "values": list(TILT_REL),
+        "readable": False,
+    }
+    out["pantilt-reset"] = {
+        "available": _xu_has(dev, PERIPH_LED_GUID, PT_RST_SEL),
+        "values": list(PT_RESET),
+        "readable": False,
+    }
+    out["pantilt-preset"] = {
+        "available": _xu_has(dev, PERIPH_LED_GUID, PT_RST_SEL),
+        "values": list(PT_PRESET),
+        "readable": False,
+    }
+    mf = motor_focus_get(dev)
+    out["motor-focus"] = {
+        "available": mf is not None,
+        "value": mf,
+        "min": 0,
+        "max": 255,
+    }
+    return out
+
+
+def anti_flicker_label(value: Any) -> str:
+    mapping = {0: "off", 1: "50", 2: "60"}
+    try:
+        return mapping[int(value)]
+    except (TypeError, ValueError, KeyError):
+        return str(value)
+
+
+def exposure_auto_label(value: Any) -> str:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if v == 1:
+        return "manual"
+    if v == 3:
+        return "auto"
+    return str(v)
+
+
+def bool_label(value: Any) -> int:
+    try:
+        return 1 if int(value) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def build_status(devinfo: dict[str, Any]) -> dict[str, Any]:
+    uvc = parse_v4l2_ctrls(devinfo["device"])
+    vendor = parse_vendor(devinfo["device"])
+    controls: dict[str, Any] = {}
+    for v4l_name, canon in V4L2_TO_CANON.items():
+        src = uvc.get(v4l_name)
+        if not src:
+            continue
+        rec = {
+            "value": src.get("value"),
+            "default": src.get("default"),
+            "min": src.get("min"),
+            "max": src.get("max"),
+            "step": src.get("step"),
+            "inactive": bool(src.get("inactive")),
+            "v4l2": v4l_name,
+        }
+        if canon == "anti-flicker":
+            rec["label"] = anti_flicker_label(src.get("value"))
+            rec["values"] = ["off", "50", "60"]
+        elif canon == "exposure-auto":
+            rec["label"] = exposure_auto_label(src.get("value"))
+            rec["values"] = ["auto", "manual"]
+        elif canon in ("focus-auto", "white-balance-auto", "dynamic-framerate", "backlight"):
+            rec["label"] = "on" if bool_label(src.get("value")) else "off"
+        controls[canon] = rec
+    if "fov" in vendor:
+        controls["fov"] = vendor["fov"]
+    else:
+        controls["fov"] = {"value": None, "values": FOV_VALUES}
+    controls["look"] = vendor.get("look", {"available": LOOKS, "readable": False})
+    for key in (
+        "led",
+        "led-frequency",
+        "pan-relative",
+        "tilt-relative",
+        "pantilt-reset",
+        "pantilt-preset",
+        "motor-focus",
+    ):
+        if key in vendor:
+            controls[key] = vendor[key]
+    return {
+        "present": True,
+        "name": devinfo["name"],
+        "model": devinfo.get("model") or NAME,
+        "usb": USB_ID,
+        "serial": devinfo["serial"],
+        "device": devinfo["device"],
+        "ir_device": devinfo["ir_device"],
+        "controls": controls,
+        "control_names": CANONICAL_STATUS_KEYS,
+    }
+
+
+def emit(obj: Any) -> None:
+    print(json.dumps(obj, indent=2, sort_keys=False))
+
+
+def need_device() -> dict[str, Any]:
+    info = resolve()
+    if not info:
+        die("brio-ctl: Logitech BRIO (USB 046d:085e) is not attached")
+    return info
+
+
+def parse_bool(raw: str) -> int:
+    v = str(raw).strip().lower()
+    if v in ("1", "on", "true", "yes", "auto"):
+        return 1
+    if v in ("0", "off", "false", "no", "manual"):
+        return 0
+    die(f"brio-ctl: expected on/off (got {raw!r})")
+    return 0
+
+
+def parse_exposure_auto(raw: str) -> int:
+    v = str(raw).strip().lower()
+    if v in ("auto", "aperture", "aperture_priority_mode", "3"):
+        return 3
+    if v in ("manual", "manual_mode", "1"):
+        return 1
+    die(f"brio-ctl: exposure-auto expects auto|manual (got {raw!r})")
+    return 3
+
+
+def parse_flicker(raw: str) -> int:
+    v = str(raw).strip().lower()
+    if v in ("off", "disabled", "0"):
+        return 0
+    if v in ("50", "50hz", "50_hz", "1"):
+        return 1
+    if v in ("60", "60hz", "60_hz", "2"):
+        return 2
+    die(f"brio-ctl: anti-flicker expects off|50|60 (got {raw!r})")
+    return 2
+
+
+def parse_fov(raw: str) -> str:
+    v = str(raw).strip().replace("°", "")
+    if v in ("65", "78", "90"):
+        return v
+    die(f"brio-ctl: fov expects 65|78|90 (got {raw!r})")
+    return v
+
+
+def parse_look(raw: str) -> str:
+    v = str(raw).strip().lower()
+    if v in LOOKS:
+        return v
+    die(f"brio-ctl: look expects one of {', '.join(LOOKS)} (got {raw!r})")
+    return v
+
+
+def parse_led(raw: str) -> str:
+    v = str(raw).strip().lower()
+    if v in LED_MODES:
+        return v
+    die(f"brio-ctl: led expects off|on|blink|auto (got {raw!r})")
+    return v
+
+
+def v4l2_set(dev: str, assignments: dict[str, Any]) -> None:
+    if not assignments:
+        return
+    payload = ",".join(f"{k}={v}" for k, v in assignments.items())
+    r = run(["v4l2-ctl", "-d", dev, "-c", payload])
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "v4l2-ctl failed").strip()
+        die(f"brio-ctl: v4l2-ctl -c {payload} failed: {err}")
+
+
+def apply_set(dev: str, pairs: list[tuple[str, str]]) -> dict[str, Any]:
+    uvc_first: dict[str, Any] = {}
+    uvc_rest: dict[str, Any] = {}
+    fov_deg: int | None = None
+    look_id: str | None = None
+    led_mode: str | None = None
+    led_freq: int | None = None
+    applied: dict[str, Any] = {}
+
+    for key, raw in pairs:
+        name = key.strip().lower()
+        if name in ("fov", "logitech_brio_fov"):
+            fov_deg = int(parse_fov(raw))
+            applied["fov"] = fov_deg
+            continue
+        if name in ("look", "color", "color_preset"):
+            look_id = parse_look(raw)
+            applied["look"] = look_id
+            continue
+        if name in ("led", "logitech_led1_mode"):
+            led_mode = parse_led(raw)
+            applied["led"] = led_mode
+            continue
+        if name in ("led-frequency", "logitech_led1_frequency"):
+            led_freq = int(raw)
+            applied["led-frequency"] = led_freq
+            continue
+        if name in ("pan-relative", "pan-rel"):
+            pan_rel_set(dev, raw)
+            applied["pan-relative"] = str(raw).strip()
+            continue
+        if name in ("tilt-relative", "tilt-rel"):
+            tilt_rel_set(dev, raw)
+            applied["tilt-relative"] = str(raw).strip()
+            continue
+        if name in ("pantilt-reset",):
+            pantilt_reset_set(dev, raw)
+            applied["pantilt-reset"] = str(raw).strip().lower()
+            continue
+        if name in ("pantilt-preset",):
+            pantilt_preset_set(dev, raw)
+            applied["pantilt-preset"] = str(raw).strip().lower()
+            continue
+        if name in ("motor-focus",):
+            motor_focus_set(dev, raw)
+            applied["motor-focus"] = int(raw)
+            continue
+        if name not in UVC:
+            die(f"brio-ctl: unknown control {key!r}")
+        v4l = UVC[name]
+        if v4l == "auto_exposure":
+            uvc_first[v4l] = parse_exposure_auto(raw)
+            applied["exposure-auto"] = "manual" if uvc_first[v4l] == 1 else "auto"
+        elif v4l == "power_line_frequency":
+            uvc_rest[v4l] = parse_flicker(raw)
+            applied["anti-flicker"] = anti_flicker_label(uvc_rest[v4l])
+        elif v4l in (
+            "focus_automatic_continuous",
+            "white_balance_automatic",
+            "exposure_dynamic_framerate",
+            "backlight_compensation",
+        ):
+            val = parse_bool(raw)
+            # Turn autos off before writing their manual companions.
+            if v4l in ("focus_automatic_continuous", "white_balance_automatic") and val == 0:
+                uvc_first[v4l] = val
+            else:
+                uvc_rest[v4l] = val
+            applied[V4L2_TO_CANON[v4l]] = val
+        elif v4l in ("focus_absolute", "exposure_time_absolute", "white_balance_temperature"):
+            # Manual companions require auto off first.
+            if v4l == "focus_absolute":
+                uvc_first["focus_automatic_continuous"] = 0
+            elif v4l == "exposure_time_absolute":
+                uvc_first["auto_exposure"] = 1
+            elif v4l == "white_balance_temperature":
+                uvc_first["white_balance_automatic"] = 0
+            uvc_rest[v4l] = int(raw)
+            applied[V4L2_TO_CANON[v4l]] = int(raw)
+        else:
+            uvc_rest[v4l] = int(raw)
+            applied[V4L2_TO_CANON.get(v4l, name)] = int(raw)
+
+    # Look first so later explicit UVC (saved brightness, contrast, …) wins.
+    if look_id is not None:
+        apply_look(dev, look_id)
+    v4l2_set(dev, uvc_first)
+    v4l2_set(dev, uvc_rest)
+    if fov_deg is not None:
+        fov_set(dev, fov_deg)
+    if led_mode is not None or led_freq is not None:
+        led_set(dev, led_mode, led_freq)
+    return applied
+
+
+def cmd_probe() -> int:
+    info = resolve()
+    if not info:
+        emit({"present": False, "usb": USB_ID, "name": NAME, "model": NAME})
+        return 1
+    emit(
+        {
+            "present": True,
+            "name": info["name"],
+            "model": info["model"],
+            "usb": USB_ID,
+            "serial": info["serial"],
+            "device": info["device"],
+            "ir_device": info["ir_device"],
+            "fov": True,
+            "zoom": True,
+        }
+    )
+    return 0
+
+
+def cmd_status() -> int:
+    emit(build_status(need_device()))
+    return 0
+
+
+def parse_assignments(args: list[str]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for a in args:
+        if "=" not in a:
+            die(f"brio-ctl set: expected KEY=VALUE (got {a!r})")
+        k, v = a.split("=", 1)
+        pairs.append((k, v))
+    if not pairs:
+        die("brio-ctl set: need at least one KEY=VALUE")
+    return pairs
+
+
+def cmd_set(args: list[str]) -> int:
+    info = need_device()
+    applied = apply_set(info["device"], parse_assignments(args))
+    emit({"ok": True, "usb": USB_ID, "set": applied})
+    return 0
+
+
+def cmd_reset() -> int:
+    info = need_device()
+    uvc = parse_v4l2_ctrls(info["device"])
+    # Restore camera-reported defaults. Enable autos first, then remaining
+    # writable UVC. Inactive companions (manual focus/exposure/WB) refuse a
+    # write while their auto control is on.
+    autos = {}
+    for name, rec in uvc.items():
+        if rec.get("default") is None:
+            continue
+        if name in ("focus_automatic_continuous", "white_balance_automatic", "auto_exposure"):
+            autos[name] = rec["default"]
+    v4l2_set(info["device"], autos)
+    rest = {}
+    for name, rec in parse_v4l2_ctrls(info["device"]).items():
+        if rec.get("default") is None or rec.get("inactive"):
+            continue
+        if name in autos:
+            continue
+        rest[name] = rec["default"]
+    v4l2_set(info["device"], rest)
+    # FoV has no camera-reported default. Leave it. Forcing 90° is the
+    # wide desk crop, which is the wrong talking-head start.
+    apply_look(info["device"], "default")
+    led_set(info["device"], "auto", None)
+    emit({"ok": True, "usb": USB_ID, "reset": True})
+    return 0
+
+
+def busy_hint(stderr: str) -> str:
+    blob = stderr.lower()
+    if "busy" in blob or "resource busy" in blob or "in use" in blob:
+        return "device busy (close the panel preview or other capture clients)"
+    return stderr.strip() or "capture failed"
+
+
+def cmd_preview(ir: bool) -> int:
+    info = need_device()
+    dev = info["ir_device"] if ir else info["device"]
+    if not dev:
+        die("brio-ctl: IR node is not available")
+    title = "BRIO IR" if ir else "Logitech BRIO"
+    mpv = [
+        "mpv",
+        f"--title={title}",
+        "--profile=low-latency",
+        "--untimed",
+        "--no-cache",
+        "--force-window=yes",
+    ]
+    if ir:
+        mpv += ["--demuxer-lavf-o=video_size=340x340"]
+    else:
+        mpv += ["--demuxer-lavf-o=input_format=mjpeg,video_size=1280x720"]
+    mpv.append(f"av://v4l2:{dev}")
+    try:
+        os.execvp("mpv", mpv)
+    except FileNotFoundError:
+        pass
+    ffplay = ["ffplay", "-fflags", "nobuffer", "-flags", "low_delay", "-i", dev]
+    try:
+        os.execvp("ffplay", ffplay)
+    except FileNotFoundError:
+        die("brio-ctl: need mpv or ffplay for preview")
+    return 1
+
+
+def cmd_snapshot(path: str | None) -> int:
+    info = need_device()
+    dest = path
+    if not dest:
+        pictures = Path.home() / "Pictures"
+        pictures.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = str(pictures / f"brio-{stamp}.jpg")
+    dest_path = Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    last_err = ""
+    for attempt in range(8):
+        busy = False
+        for size in ("3840x2160", "4096x2160"):
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "v4l2",
+                "-input_format",
+                "mjpeg",
+                "-video_size",
+                size,
+                "-framerate",
+                "30",
+                "-i",
+                info["device"],
+                "-frames:v",
+                "16",
+                "-update",
+                "1",
+                "-q:v",
+                "2",
+                str(dest_path),
+            ]
+            r = run(cmd, timeout=40)
+            if r.returncode == 0 and dest_path.is_file() and dest_path.stat().st_size > 100:
+                emit(
+                    {
+                        "ok": True,
+                        "usb": USB_ID,
+                        "path": str(dest_path),
+                        "size": size,
+                        "bytes": dest_path.stat().st_size,
+                    }
+                )
+                return 0
+            last_err = busy_hint((r.stderr or r.stdout or "").strip())
+            if "busy" in last_err.lower():
+                busy = True
+                break
+        if busy:
+            time.sleep(0.08)
+            continue
+        break
+    die(f"brio-ctl snapshot failed: {last_err}")
+    return 1
+
+
+def usage() -> None:
+    print(
+        """Usage: brio-ctl <command>
+
+Commands:
+  probe                 JSON identity of the attached Logitech BRIO (046d:085e)
+  status                JSON of UVC + vendor controls (FoV, look, LED)
+  set KEY=VALUE ...     Write controls; names: brightness, contrast, saturation,
+                        sharpness, gain, backlight, anti-flicker, zoom, pan, tilt,
+                        focus, focus-auto, exposure, exposure-auto, white-balance,
+                        white-balance-auto, dynamic-framerate, fov, look, led,
+                        led-frequency, pan-relative, tilt-relative, pantilt-reset,
+                        pantilt-preset, motor-focus. status.available is false
+                        when this camera has no matching XU.
+  reset                 Restore camera-reported UVC defaults and look default. FoV is unchanged.
+  preview               Open a live window on the main node
+  preview-ir            Open a live window on the IR node (emitters stay off)
+  snapshot [PATH]       Write a 4K JPEG (3840x2160 or 4096x2160)
+
+Bound to USB 046d:085e only. The laptop webcam is never selected.
+""",
+        end="",
+    )
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        usage()
+        return 0
+    cmd = argv[0]
+    rest = argv[1:]
+    try:
+        if cmd == "probe":
+            return cmd_probe()
+        if cmd == "status":
+            return cmd_status()
+        if cmd == "set":
+            return cmd_set(rest)
+        if cmd == "reset":
+            return cmd_reset()
+        if cmd == "preview":
+            return cmd_preview(False)
+        if cmd == "preview-ir":
+            return cmd_preview(True)
+        if cmd == "snapshot":
+            return cmd_snapshot(rest[0] if rest else None)
+        die(f"brio-ctl: unknown command {cmd!r}")
+        return 1
+    except subprocess.TimeoutExpired:
+        die("brio-ctl: command timed out")
+        return 1
+    except FileNotFoundError as e:
+        die(f"brio-ctl: missing tool: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    # python3 - <args>  → argv[0] is "-"
+    sys.exit(main(sys.argv[1:]))
+PY

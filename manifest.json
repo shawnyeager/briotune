@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.shawnyeager.briotune",
+  "name": "BrioTune",
+  "version": "1.0.0",
+  "author": "Shawn Yeager",
+  "license": "MIT",
+  "description": "Logi Tune-like for the Brio line, Quattro-native.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "BrioTune",
+    "description": "Frame a Logitech Brio: live preview, FoV, zoom, look, 4K photo",
+    "category": "Devices",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
